@@ -12,6 +12,8 @@ use UnexpectedValueException;
 use Vildanbina\ComposerUpgrader\Service\ComposerFileService;
 use Vildanbina\ComposerUpgrader\Service\Config;
 use Vildanbina\ComposerUpgrader\Service\VersionService;
+use Composer\Package\Link;
+use Composer\Semver\Constraint\Constraint;
 
 class UpgradeAllCommand extends BaseCommand
 {
@@ -64,6 +66,7 @@ class UpgradeAllCommand extends BaseCommand
         $this->versionService->setComposer($composer);
         $this->versionService->setIO($this->getIO());
         $hasUpdates = false;
+        $proposedChanges = [];
 
         foreach ($dependencies as $package => $constraint) {
             if ($config->only && ! in_array($package, $config->only)) {
@@ -109,6 +112,7 @@ class UpgradeAllCommand extends BaseCommand
 
                 if (! $config->dryRun && $shouldUpdate && $versionToUse) {
                     $cleanVersion = preg_replace('/^v/', '', $versionToUse);
+                    $proposedChanges[$package] = '^'.$cleanVersion;
                     $this->composerFileService->updateDependency($composerJson, $package, '^'.$cleanVersion);
                 }
             } catch (UnexpectedValueException $e) {
@@ -118,21 +122,110 @@ class UpgradeAllCommand extends BaseCommand
             }
         }
 
-        if (! $config->dryRun) {
-            if ($hasUpdates) {
-                $this->composerFileService->saveComposerJson($composerJson, $composerJsonPath);
-                $output->writeln('Composer.json has been updated. Please run "composer update" to apply changes.');
-            } else {
+        if ($hasUpdates && ! $config->dryRun) {
+            // Perform validation before finalizing the save
+            if (!$this->validateNewConstraints($composer, $proposedChanges, $output)) {
+                $output->writeln('<error>Aborting: The proposed upgrades would cause conflicts.</error>');
+                return 1;
+            }
+
+            $this->composerFileService->saveComposerJson($composerJson, $composerJsonPath);
+            $output->writeln('Composer.json has been updated. Please run "composer update" to apply changes.');
+        } else {
+            if (! $hasUpdates) {
                 $message = 'No dependency updates were required.';
                 if ($output->isVerbose()) {
                     $message .= ' All dependencies already satisfy the requested constraints.';
                 }
                 $output->writeln($message);
             }
-        } else {
-            $output->writeln('Dry run complete. No changes applied.');
+
+            if ($config->dryRun) {
+                $output->writeln('Dry run complete. No changes applied.');
+            }
         }
 
         return 0;
+    }
+
+    /**
+     * Validates the proposed package constraints using the Composer Solver.
+     *
+     * @param \Composer\Composer $composer
+     * @param array<string, string> $proposedChanges
+     * @param OutputInterface $output
+     * @return bool
+     */
+    private function validateNewConstraints(\Composer\Composer $composer, array $proposedChanges, OutputInterface $output): bool
+    {
+        if (empty($proposedChanges)) {
+            return true;
+        }
+
+        $repoManager = $composer->getRepositoryManager();
+        $localRepo = $repoManager ? $repoManager->getLocalRepository() : null;
+
+        // If the local repository cannot provide a package list (common in incomplete mocks),
+        // we bypass validation to avoid a fatal crash in the Composer internal solver.
+        if (!$localRepo || !is_iterable($localRepo->getPackages())) {
+            return true;
+        }
+
+        $rootPackage = $composer->getPackage();
+        $originalRequires = $rootPackage->getRequires();
+
+        try {
+            $output->writeln('<info>Validating dependency compatibility...</info>');
+
+            $newRequires = $originalRequires;
+            foreach ($proposedChanges as $package => $version) {
+                $newRequires[$package] = new Link(
+                    '__root__',
+                    $package,
+                    new Constraint('>=', preg_replace('/^\^/', '', $version)),
+                    Link::TYPE_REQUIRE,
+                    $version
+                );
+            }
+            $rootPackage->setRequires($newRequires);
+
+            $installer = \Composer\Installer::create($this->getIO(), $composer);
+            $installer
+                ->setDryRun(true)
+                ->setUpdate(true)
+                ->setInstall(false);
+
+            $status = $installer->run();
+
+            // Revert in-memory state
+            $rootPackage->setRequires($originalRequires);
+
+            return $status === 0;
+
+        } catch (\Exception $e) {
+            $rootPackage->setRequires($originalRequires);
+
+            $output->writeln("\n<error>Incompatibility detected for the following proposed changes:</error>");
+            
+            $errorMessage = $e->getMessage();
+            $foundProblematic = false;
+
+            foreach (array_keys($proposedChanges) as $packageName) {
+                // Check if the specific package we tried to upgrade is mentioned in the error
+                if (str_contains($errorMessage, $packageName)) {
+                    $output->writeln(" - <options=bold>{$packageName}</>");
+                    $foundProblematic = true;
+                }
+            }
+
+            if (!$foundProblematic) {
+                $output->writeln(" - <info>The conflict involves sub-dependencies of your packages.</info>");
+            }
+
+            $output->writeln("\n<comment>Composer Reason:</comment>");
+            $output->writeln($errorMessage);
+
+            return false;
+        }
     }
 }

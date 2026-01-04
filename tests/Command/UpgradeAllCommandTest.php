@@ -254,4 +254,31 @@ class UpgradeAllCommandTest extends TestCase
         $this->assertStringContainsString('No dependency updates were required.', $output);
         $this->assertEquals(0, $tester->getStatusCode());
     }
+
+    public function test_execute_aborts_and_does_not_save_on_dependency_conflict(): void
+    {
+        $repoManager = $this->command->getApplication()->getComposer()->getRepositoryManager();
+        $installedRepo = $this->createMock(\Composer\Repository\InstalledRepositoryInterface::class);
+        $installedRepo->method('getPackages')->willReturn([]);
+        
+        $repoManager->method('getLocalRepository')->willReturn($installedRepo);
+
+        $this->fileService->expects($this->once())
+            ->method('loadComposerJson')
+            ->willReturn(['require' => ['test/package' => '^1.0.0']]);
+            
+        $this->fileService->expects($this->once())
+            ->method('getDependencies')
+            ->willReturn(['test/package' => '^1.0.0']);
+
+        $this->fileService->expects($this->never())
+            ->method('saveComposerJson');
+
+        $tester = new CommandTester($this->command);
+        $exitCode = $tester->execute(['--patch' => true]);
+
+        $this->assertEquals(1, $exitCode);
+        $this->assertStringContainsString('Validating dependency compatibility', $tester->getDisplay());
+        $this->assertStringContainsString('Aborting', $tester->getDisplay());
+    }
 }
